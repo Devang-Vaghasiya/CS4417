@@ -453,21 +453,6 @@
 <script>
 
 
-// ── bcrypt simulation ─────────────────────────────────────────────────────
-async function bcryptHash(password) {
-  const salt = crypto.getRandomValues(new Uint8Array(16));
-  const saltHex = Array.from(salt).map(b => b.toString(16).padStart(2,'0')).join('');
-  const buf = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(saltHex + password));
-  const hex = Array.from(new Uint8Array(buf)).map(b => b.toString(16).padStart(2,'0')).join('');
-  return `$2b$12$${saltHex}${hex}`;
-}
-async function bcryptVerify(password, hash) {
-  const saltHex = hash.slice(7, 39);
-  const buf = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(saltHex + password));
-  const hex = Array.from(new Uint8Array(buf)).map(b => b.toString(16).padStart(2,'0')).join('');
-  return hash === `$2b$12$${saltHex}${hex}`;
-}
-
 // ── Sanitization ──────────────────────────────────────────────────────────
 function sanitizeInput(str) {
   if (typeof str !== 'string') return '';
@@ -484,24 +469,86 @@ function validatePassword(p) {
 
 // ── Data ──────────────────────────────────────────────────────────────────
 // ── API URL ────────────────────────────────────────────────────────────────
-const API = 'http://localhost:5000/api';
+const API = 'http://127.0.0.1:5050/api';
 
-// ── Auth state (Step 8.1 from the guide) ──────────────────────────────────
+// ── Auth state ─────────────────────────────────────────────────────────────
 let authToken = null;
 let currentUser = null;
 let pendingDeleteId = null;
+let usersCache = [];
+let feedbackCache = [];
 
-// ── Authenticated fetch helper (Step 8.2 from the guide) ──────────────────
+// ── API helpers ────────────────────────────────────────────────────────────
 async function apiFetch(path, options = {}) {
+  const headers = {
+    ...(options.body ? { 'Content-Type': 'application/json' } : {}),
+    ...(authToken ? { 'Authorization': `Bearer ${authToken}` } : {}),
+    ...(options.headers || {})
+  };
+
   const res = await fetch(`${API}${path}`, {
     ...options,
-    headers: {
-      'Content-Type': 'application/json',
-      'Authorization': `Bearer ${authToken}`,
-      ...(options.headers || {})
-    }
+    headers
   });
+
+  if (res.status === 401) {
+    clearSession();
+  }
+
   return res;
+}
+
+async function readJson(res) {
+  const text = await res.text();
+  if (!text) return null;
+  try {
+    return JSON.parse(text);
+  } catch {
+    return null;
+  }
+}
+
+function getErrorMessage(payload, fallback) {
+  return payload?.error || payload?.message || fallback;
+}
+
+function normalizeUser(user) {
+  if (!user) return null;
+  return {
+    ...user,
+    id: user.id || user._id
+  };
+}
+
+function persistSession() {
+  if (!authToken || !currentUser) return;
+  localStorage.setItem('authToken', authToken);
+  localStorage.setItem('currentUser', JSON.stringify(currentUser));
+}
+
+function clearSession() {
+  authToken = null;
+  currentUser = null;
+  usersCache = [];
+  feedbackCache = [];
+  localStorage.removeItem('authToken');
+  localStorage.removeItem('currentUser');
+}
+
+function restoreSession() {
+  const savedToken = localStorage.getItem('authToken');
+  const savedUser = localStorage.getItem('currentUser');
+
+  if (!savedToken || !savedUser) return false;
+
+  try {
+    authToken = savedToken;
+    currentUser = normalizeUser(JSON.parse(savedUser));
+    return !!currentUser;
+  } catch {
+    clearSession();
+    return false;
+  }
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────
@@ -545,23 +592,44 @@ function updateCounter(inputId, max, counterId) {
 async function doLogin() {
   $('loginError').classList.remove('show');
   const email = $('loginEmail').value.trim().toLowerCase();
-  const pass  = $('loginPassword').value;
-  const user  = USERS.find(u => u.email === email);
-  if (!user || !(await bcryptVerify(pass, user.passwordHash))) {
-    $('loginError').classList.add('show'); return;
+  const password = $('loginPassword').value;
+
+  try {
+    const res = await apiFetch('/auth/login', {
+      method: 'POST',
+      body: JSON.stringify({ email, password })
+    });
+    const payload = await readJson(res);
+
+    if (!res.ok) {
+      $('loginError').textContent = getErrorMessage(payload, 'The email or password you entered is incorrect.');
+      $('loginError').classList.add('show');
+      return;
+    }
+
+    authToken = payload.token;
+    currentUser = normalizeUser(payload.user);
+    persistSession();
+    $('loginPassword').value = '';
+    enterDashboard();
+  } catch {
+    $('loginError').textContent = 'Unable to reach the backend. Make sure the server is running on port 5000.';
+    $('loginError').classList.add('show');
   }
-  currentUser = user; enterDashboard();
 }
 
 function doLogout() {
-  currentUser = null;
+  clearSession();
   $('waffleWrap').style.display = 'none';
-  $('loginEmail').value = ''; $('loginPassword').value = '';
+  $('loginEmail').value = '';
+  $('loginPassword').value = '';
   $('loginError').classList.remove('show');
+  hideAddUserForm();
   showScreen('screenLogin');
 }
 
 function enterDashboard() {
+  if (!currentUser) return;
   const isAdmin = currentUser.role === 'admin';
   $('waffleWrap').style.display = 'block';
   $('wuName').textContent = `${currentUser.first} ${currentUser.last}`;
@@ -573,7 +641,10 @@ function enterDashboard() {
   $('tabUsersBtn').style.display    = isAdmin ? 'inline-block' : 'none';
   $('tabFeedbackBtn').style.display = isAdmin ? 'inline-block' : 'none';
   loadProfile();
-  if (isAdmin) { renderUsersTable(); renderFeedbackTable(); }
+  if (isAdmin) {
+    renderUsersTable();
+    renderFeedbackTable();
+  }
   switchTab('tabProfile', $('tabProfileBtn'));
   showScreen('screenDashboard');
 }
@@ -596,14 +667,37 @@ async function doRegister() {
   setF('regEmail','regEmailErr', validateEmail(email));
   setF('regPassword','regPassErr', validatePassword(pass));
   setF('regConfirm', 'regConfErr', pass === conf);
-  if (!valid) return;
-  if (USERS.find(u => u.email === email)) { setMsg($('regError'),'⚠ An account with this email already exists.'); return; }
-  USERS.push({ id: nextId++, first: sanitizeInput(first), last: sanitizeInput(last), email, passwordHash: await bcryptHash(pass), role:'customer' });
-  setMsg($('regSuccess'), '✓ Account created! Redirecting to sign in…', 'success');
-  setTimeout(() => {
-    ['regFirst','regLast','regEmail','regPassword','regConfirm'].forEach(id => $(id).value='');
-    showScreen('screenLogin'); $('loginEmail').value = email;
-  }, 1800);
+  if (!valid) {
+    setMsg($('regError'), '⚠ Please fix the highlighted fields. Passwords must be at least 8 characters and include uppercase, lowercase, a number, and a symbol.');
+    return;
+  }
+
+  try {
+    const res = await apiFetch('/auth/register', {
+      method: 'POST',
+      body: JSON.stringify({
+        first: sanitizeInput(first),
+        last: sanitizeInput(last),
+        email,
+        password: pass
+      })
+    });
+    const payload = await readJson(res);
+
+    if (!res.ok) {
+      setMsg($('regError'), `⚠ ${getErrorMessage(payload, 'Unable to create account.')}`);
+      return;
+    }
+
+    setMsg($('regSuccess'), 'Account created successfully. Redirecting to sign in…', 'success');
+    setTimeout(() => {
+      ['regFirst','regLast','regEmail','regPassword','regConfirm'].forEach(id => $(id).value='');
+      showScreen('screenLogin');
+      $('loginEmail').value = email;
+    }, 1800);
+  } catch {
+    setMsg($('regError'), '⚠ Unable to reach the backend. Make sure the server is running on port 5000.');
+  }
 }
 
 // ── Profile ───────────────────────────────────────────────────────────────
@@ -625,16 +719,31 @@ function openEditProfile() {
   closeWaffle();
 }
 function closeEditProfile() { $('editProfileModal').classList.remove('open'); }
-function saveProfileModal() {
+async function saveProfileModal() {
   clearMsg($('modalProfileErr')); clearMsg($('modalProfileOk'));
   const first = $('mEditFirst').value.trim();
   const last  = $('mEditLast').value.trim();
   const email = $('mEditEmail').value.trim().toLowerCase();
   if (!validateName(first)||!validateName(last)) { setMsg($('modalProfileErr'),'⚠ Names may only contain letters, spaces, or hyphens.'); return; }
   if (!validateEmail(email)) { setMsg($('modalProfileErr'),'⚠ Please enter a valid email address.'); return; }
-  if (USERS.find(u => u.email === email && u.id !== currentUser.id)) { setMsg($('modalProfileErr'),'⚠ That email is already in use.'); return; }
-  currentUser.first = sanitizeInput(first); currentUser.last = sanitizeInput(last); currentUser.email = email;
-  Object.assign(USERS.find(u => u.id === currentUser.id), { first: currentUser.first, last: currentUser.last, email });
+
+  const res = await apiFetch('/auth/profile', {
+    method: 'PUT',
+    body: JSON.stringify({
+      first: sanitizeInput(first),
+      last: sanitizeInput(last),
+      email
+    })
+  });
+  const payload = await readJson(res);
+
+  if (!res.ok) {
+    setMsg($('modalProfileErr'), `⚠ ${getErrorMessage(payload, 'Unable to update profile.')}`);
+    return;
+  }
+
+  currentUser = normalizeUser(payload);
+  persistSession();
   setMsg($('modalProfileOk'), '✓ Profile updated successfully.', 'success');
   loadProfile(); $('wuName').textContent = `${currentUser.first} ${currentUser.last}`;
   setTimeout(closeEditProfile, 1200);
@@ -645,41 +754,84 @@ async function doChangePassword() {
   clearMsg($('pwChangeErr')); clearMsg($('pwChangeOk'));
   $('pwNewErr').classList.remove('show'); $('pwConfErr').classList.remove('show');
   const cur = $('pwCurrent').value, nw = $('pwNew').value, conf = $('pwConfirm').value;
-  if (!(await bcryptVerify(cur, currentUser.passwordHash))) { setMsg($('pwChangeErr'),'⚠ Current password is incorrect.'); return; }
   if (!validatePassword(nw)) { $('pwNewErr').classList.add('show'); return; }
   if (nw !== conf) { $('pwConfErr').classList.add('show'); return; }
-  if (await bcryptVerify(nw, currentUser.passwordHash)) { setMsg($('pwChangeErr'),'⚠ New password must differ from the current one.'); return; }
-  const newHash = await bcryptHash(nw);
-  currentUser.passwordHash = newHash;
-  USERS.find(u => u.id === currentUser.id).passwordHash = newHash;
+
+  const res = await apiFetch('/auth/change-password', {
+    method: 'PUT',
+    body: JSON.stringify({
+      currentPassword: cur,
+      newPassword: nw
+    })
+  });
+  const payload = await readJson(res);
+
+  if (!res.ok) {
+    setMsg($('pwChangeErr'), `⚠ ${getErrorMessage(payload, 'Unable to update password.')}`);
+    return;
+  }
+
   $('pwCurrent').value = ''; $('pwNew').value = ''; $('pwConfirm').value = '';
   setMsg($('pwChangeOk'), '✓ Password updated successfully.', 'success');
 }
 
 // ── User Management ───────────────────────────────────────────────────────
-function renderUsersTable() {
-  const tbody = $('usersTableBody'); tbody.innerHTML = '';
-  USERS.forEach(u => {
-    const isSelf = u.id === currentUser.id;
+async function loadUsers() {
+  const res = await apiFetch('/users');
+  const payload = await readJson(res);
+
+  if (!res.ok) {
+    throw new Error(getErrorMessage(payload, 'Unable to load users.'));
+  }
+
+  usersCache = payload.map(normalizeUser);
+}
+
+async function renderUsersTable() {
+  const tbody = $('usersTableBody');
+
+  try {
+    await loadUsers();
+  } catch (err) {
+    tbody.innerHTML = `<tr><td colspan="4" style="text-align:center;color:var(--danger);padding:2rem">${sanitizeInput(err.message)}</td></tr>`;
+    return;
+  }
+
+  tbody.innerHTML = '';
+
+  usersCache.forEach(u => {
+    const isSelf = String(u.id) === String(currentUser.id);
     const tr = document.createElement('tr');
     tr.innerHTML = `
-      <td>${u.first} ${u.last}${isSelf?' <span style="font-size:0.72rem;color:var(--accent)">(you)</span>':''}</td>
+      <td>${sanitizeInput(u.first)} ${sanitizeInput(u.last)}${isSelf ? ' <span style="font-size:0.72rem;color:var(--accent)">(you)</span>' : ''}</td>
       <td>${u.email}</td>
-      <td><span class="role-badge ${u.role==='admin'?'role-admin':'role-customer'}">${u.role}</span></td>
-      <td>
-        <div class="table-actions">
-          ${!isSelf
-            ? `<button class="btn-edit" onclick="openEditUser(${u.id})">Edit</button>
-               <button class="btn-delete" onclick="openDeleteConfirm(${u.id}, '${u.first} ${u.last}')">Delete</button>`
-            : '<span style="color:var(--light);font-size:0.8rem">—</span>'}
-        </div>
-      </td>`;
+      <td><span class="role-badge ${u.role==='admin'?'role-admin':'role-customer'}">${sanitizeInput(u.role)}</span></td>
+      <td><div class="table-actions"></div></td>`;
+
+    const actions = tr.querySelector('.table-actions');
+    if (isSelf) {
+      actions.innerHTML = '<span style="color:var(--light);font-size:0.8rem">—</span>';
+    } else {
+      const editBtn = document.createElement('button');
+      editBtn.className = 'btn-edit';
+      editBtn.textContent = 'Edit';
+      editBtn.onclick = () => openEditUser(u.id);
+
+      const deleteBtn = document.createElement('button');
+      deleteBtn.className = 'btn-delete';
+      deleteBtn.textContent = 'Delete';
+      deleteBtn.onclick = () => openDeleteConfirm(u.id, `${u.first} ${u.last}`);
+
+      actions.appendChild(editBtn);
+      actions.appendChild(deleteBtn);
+    }
+
     tbody.appendChild(tr);
   });
 }
 
 function openEditUser(id) {
-  const u = USERS.find(u => u.id === id); if (!u) return;
+  const u = usersCache.find(u => String(u.id) === String(id)); if (!u) return;
   clearMsg($('editUserErr')); clearMsg($('editUserOk'));
   $('editUserId').value = id;
   $('euFirst').value  = u.first;
@@ -689,18 +841,32 @@ function openEditUser(id) {
   $('editUserModal').classList.add('open');
 }
 function closeEditUser() { $('editUserModal').classList.remove('open'); }
-function saveEditUser() {
+async function saveEditUser() {
   clearMsg($('editUserErr')); clearMsg($('editUserOk'));
-  const id    = parseInt($('editUserId').value);
+  const id    = $('editUserId').value;
   const first = $('euFirst').value.trim();
   const last  = $('euLast').value.trim();
   const email = $('euEmail').value.trim().toLowerCase();
   const role  = $('euRole').value;
   if (!validateName(first)||!validateName(last)) { setMsg($('editUserErr'),'⚠ Valid first and last name required.'); return; }
   if (!validateEmail(email)) { setMsg($('editUserErr'),'⚠ Valid email address required.'); return; }
-  if (USERS.find(u => u.email === email && u.id !== id)) { setMsg($('editUserErr'),'⚠ That email is already in use.'); return; }
-  const u = USERS.find(u => u.id === id); if (!u) return;
-  u.first = sanitizeInput(first); u.last = sanitizeInput(last); u.email = email; u.role = role;
+
+  const res = await apiFetch(`/users/${id}`, {
+    method: 'PUT',
+    body: JSON.stringify({
+      first: sanitizeInput(first),
+      last: sanitizeInput(last),
+      email,
+      role
+    })
+  });
+  const payload = await readJson(res);
+
+  if (!res.ok) {
+    setMsg($('editUserErr'), `⚠ ${getErrorMessage(payload, 'Unable to update user.')}`);
+    return;
+  }
+
   setMsg($('editUserOk'), '✓ User updated.', 'success');
   renderUsersTable();
   setTimeout(closeEditUser, 1000);
@@ -712,11 +878,22 @@ function openDeleteConfirm(id, name) {
   $('deleteConfirmModal').classList.add('open');
 }
 function closeDeleteConfirm() { $('deleteConfirmModal').classList.remove('open'); pendingDeleteId = null; }
-function confirmDeleteUser() {
+async function confirmDeleteUser() {
   if (pendingDeleteId === null) return;
-  const idx = USERS.findIndex(u => u.id === pendingDeleteId);
-  if (idx !== -1) USERS.splice(idx, 1);
-  closeDeleteConfirm(); renderUsersTable();
+
+  const res = await apiFetch(`/users/${pendingDeleteId}`, {
+    method: 'DELETE'
+  });
+  const payload = await readJson(res);
+
+  if (!res.ok) {
+    closeDeleteConfirm();
+    alert(getErrorMessage(payload, 'Unable to delete user.'));
+    return;
+  }
+
+  closeDeleteConfirm();
+  renderUsersTable();
 }
 
 async function doAddUser() {
@@ -726,8 +903,24 @@ async function doAddUser() {
   if (!validateName(first)||!validateName(last)) { setMsg($('addUserErr'),'⚠ Valid first and last name required.'); return; }
   if (!validateEmail(email)) { setMsg($('addUserErr'),'⚠ Valid email required.'); return; }
   if (!validatePassword(pass)) { setMsg($('addUserErr'),'⚠ Password: min 8 chars, upper, lower, number & symbol.'); return; }
-  if (USERS.find(u => u.email === email)) { setMsg($('addUserErr'),'⚠ A user with this email already exists.'); return; }
-  USERS.push({ id: nextId++, first: sanitizeInput(first), last: sanitizeInput(last), email, passwordHash: await bcryptHash(pass), role });
+
+  const res = await apiFetch('/users', {
+    method: 'POST',
+    body: JSON.stringify({
+      first: sanitizeInput(first),
+      last: sanitizeInput(last),
+      email,
+      password: pass,
+      role
+    })
+  });
+  const payload = await readJson(res);
+
+  if (!res.ok) {
+    setMsg($('addUserErr'), `⚠ ${getErrorMessage(payload, 'Unable to create user.')}`);
+    return;
+  }
+
   ['newFirst','newLast','newEmail','newPass'].forEach(id => $(id).value='');
   $('newRole').value = 'customer';
   hideAddUserForm(); renderUsersTable();
@@ -738,6 +931,11 @@ function hideAddUserForm() { $('addUserForm').style.display='none'; }
 // ── Feedback ──────────────────────────────────────────────────────────────
 async function doSubmitContact() {
   clearMsg($('contactErr'));
+  if (!authToken) {
+    setMsg($('contactErr'), '⚠ Please log in before submitting feedback.');
+    return;
+  }
+
   const message = $('contactMessage').value.trim();
   const valid = message.length >= 10 && message.length <= 1000;
   $('contactMessage').classList.toggle('error', !valid);
@@ -761,17 +959,38 @@ async function doSubmitContact() {
 }
 
 // ── Feedback table ────────────────────────────────────────────────────────
-function renderFeedbackTable() {
+async function loadFeedback() {
+  const res = await apiFetch('/feedback');
+  const payload = await readJson(res);
+
+  if (!res.ok) {
+    throw new Error(getErrorMessage(payload, 'Unable to load feedback.'));
+  }
+
+  feedbackCache = payload || [];
+}
+
+async function renderFeedbackTable() {
   const tbody = $('feedbackTableBody');
-  if (!FEEDBACK.length) { tbody.innerHTML = '<tr><td colspan="4" style="text-align:center;color:var(--light);padding:2rem">No submissions yet.</td></tr>'; return; }
+
+  try {
+    await loadFeedback();
+  } catch (err) {
+    tbody.innerHTML = `<tr><td colspan="4" style="text-align:center;color:var(--danger);padding:2rem">${sanitizeInput(err.message)}</td></tr>`;
+    return;
+  }
+
+  if (!feedbackCache.length) { tbody.innerHTML = '<tr><td colspan="4" style="text-align:center;color:var(--light);padding:2rem">No submissions yet.</td></tr>'; return; }
   tbody.innerHTML = '';
-  FEEDBACK.slice().reverse().forEach(f => {
+
+  feedbackCache.forEach(f => {
+    const fullName = `${f.userId?.first || ''} ${f.userId?.last || ''}`.trim() || 'Unknown User';
     const tr = document.createElement('tr');
     tr.innerHTML = `
-      <td style="white-space:nowrap;font-size:0.78rem;color:var(--light)">${f.submitted}</td>
-      <td>${f.name}</td>
-      <td style="font-size:0.82rem">${f.email}</td>
-      <td class="feedback-msg">${f.message.slice(0,180)}${f.message.length>180?'…':''}</td>`;
+      <td style="white-space:nowrap;font-size:0.78rem;color:var(--light)">${new Date(f.createdAt).toLocaleString()}</td>
+      <td>${sanitizeInput(fullName)}</td>
+      <td style="font-size:0.82rem">${sanitizeInput(f.userId?.email || 'Unknown')}</td>
+      <td class="feedback-msg">${sanitizeInput(f.message.slice(0,180))}${f.message.length>180?'…':''}</td>`;
     tbody.appendChild(tr);
   });
 }
@@ -785,6 +1004,10 @@ function switchTab(panelId, btn) {
   if (panel) panel.classList.add('active');
   if (panelId === 'tabUsers') renderUsersTable();
   if (panelId === 'tabFeedbackAdmin') renderFeedbackTable();
+}
+
+if (restoreSession()) {
+  enterDashboard();
 }
 </script>
 </body>

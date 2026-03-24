@@ -451,6 +451,8 @@
 </div>
 
 <script>
+
+
 // ── bcrypt simulation ─────────────────────────────────────────────────────
 async function bcryptHash(password) {
   const salt = crypto.getRandomValues(new Uint8Array(16));
@@ -481,13 +483,26 @@ function validatePassword(p) {
 }
 
 // ── Data ──────────────────────────────────────────────────────────────────
-const USERS = [], FEEDBACK = [];
-let nextId = 1, currentUser = null, pendingDeleteId = null;
+// ── API URL ────────────────────────────────────────────────────────────────
+const API = 'http://localhost:5000/api';
 
-(async () => {
-  USERS.push({ id: nextId++, first:'Admin', last:'User', email:'admin@cs4417.com', passwordHash: await bcryptHash('Admin@1234'), role:'admin' });
-  USERS.push({ id: nextId++, first:'Jane', last:'Doe', email:'jane@example.com', passwordHash: await bcryptHash('Pass@5678'), role:'customer' });
-})();
+// ── Auth state (Step 8.1 from the guide) ──────────────────────────────────
+let authToken = null;
+let currentUser = null;
+let pendingDeleteId = null;
+
+// ── Authenticated fetch helper (Step 8.2 from the guide) ──────────────────
+async function apiFetch(path, options = {}) {
+  const res = await fetch(`${API}${path}`, {
+    ...options,
+    headers: {
+      'Content-Type': 'application/json',
+      'Authorization': `Bearer ${authToken}`,
+      ...(options.headers || {})
+    }
+  });
+  return res;
+}
 
 // ── Helpers ───────────────────────────────────────────────────────────────
 const $ = id => document.getElementById(id);
@@ -721,7 +736,7 @@ function showAddUserForm() { $('addUserForm').style.display='block'; clearMsg($(
 function hideAddUserForm() { $('addUserForm').style.display='none'; }
 
 // ── Feedback ──────────────────────────────────────────────────────────────
-function doSubmitContact() {
+async function doSubmitContact() {
   clearMsg($('contactErr'));
   const message = $('contactMessage').value.trim();
   const valid = message.length >= 10 && message.length <= 1000;
@@ -729,15 +744,18 @@ function doSubmitContact() {
   $('contactMsgErr').classList.toggle('show', !valid);
   if (!valid) return;
 
-  const cleanMessage = sanitizeInput(message);
-  const now = new Date().toLocaleString();
-  // Parameterized query pattern (logged to console)
-  console.log('[CS4417] INSERT INTO feedback (user_id, message, submitted_at) VALUES ($1, $2, $3)',
-    [currentUser.id, cleanMessage, now]);
-  FEEDBACK.push({ submitted: now, name: `${currentUser.first} ${currentUser.last}`, email: currentUser.email, message: cleanMessage });
-  if (currentUser?.role === 'admin') renderFeedbackTable();
+  const res = await apiFetch('/feedback', {
+    method: 'POST',
+    body: JSON.stringify({ message })
+  });
 
-  // Hide form, show thank you
+  if (!res.ok) {
+    const err = await res.json();
+    setMsg($('contactErr'), '⚠ ' + (err.error || 'Submission failed.'));
+    return;
+  }
+
+  // Show thank you screen
   $('feedbackFormView').style.display = 'none';
   $('feedbackThankyou').style.display = 'block';
 }

@@ -41,4 +41,4 @@ router.get('/', authMW, async (req, res) => {
   }
 });
  
-module. Exports = router;
+module.exports = router;

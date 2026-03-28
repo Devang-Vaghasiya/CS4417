@@ -467,6 +467,15 @@ function validatePassword(p) {
   return p.length >= 8 && /[A-Z]/.test(p) && /[a-z]/.test(p) && /[0-9]/.test(p) && /[^A-Za-z0-9]/.test(p);
 }
 
+function sanitizePlainText(str) {
+  if (typeof str !== 'string') return '';
+  return str
+    .normalize('NFKC')
+    .replace(/[\u0000-\u001F\u007F]/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
 // ── Data ──────────────────────────────────────────────────────────────────
 // ── API URL ────────────────────────────────────────────────────────────────
 const API = 'http://127.0.0.1:5050/api';
@@ -613,7 +622,7 @@ async function doLogin() {
     $('loginPassword').value = '';
     enterDashboard();
   } catch {
-    $('loginError').textContent = 'Unable to reach the backend. Make sure the server is running on port 5000.';
+    $('loginError').textContent = 'Unable to reach the backend. Make sure the server is running on port 5050.';
     $('loginError').classList.add('show');
   }
 }

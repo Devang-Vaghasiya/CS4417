@@ -1,18 +1,21 @@
-const mongoose = require('mongoose');
-const { sanitizePlainText } = require('../utils/sanitize');
+const mongoose = require("mongoose");
+const { sanitizePlainText } = require("../utils/sanitize");
 
-const feedbackSchema = new mongoose.Schema({
-  userId: {
-    type: mongoose.Schema.Types.ObjectId,
-    ref: 'User',
-    required: true
+const feedbackSchema = new mongoose.Schema(
+  {
+    userId: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: "User",
+      required: true,
+    },
+    message: {
+      type: String,
+      default: "",
+      maxlength: 1000,
+      set: sanitizePlainText,
+    },
   },
-  message: {
-    type: String,
-    default: '',
-    maxlength: 1000,
-    set: sanitizePlainText
-  }
-}, { timestamps: true });
+  { timestamps: true },
+);
 
-module.exports = mongoose.model('Feedback', feedbackSchema);
+module.exports = mongoose.model("Feedback", feedbackSchema);
